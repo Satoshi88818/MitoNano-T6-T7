@@ -1,0 +1,79 @@
+//! # mitonano_core
+//!
+//! The physics engine `mitonano_orchestrator`'s nodes actually run:
+//! bounded SDE agent motion, a diffusible concentration field with
+//! release/uptake coupling, and radius-limited agent-agent exchange —
+//! unified into one tick loop and, per this crate's own profiling work,
+//! offered in single-threaded, phase-timed, and rayon-parallel variants.
+//!
+//! ## Provenance
+//!
+//! Exactly one file in this crate is verbatim, uploaded source:
+//! `unified_engine.rs` — copied byte-for-byte (verified via `diff`
+//! against the original upload) rather than retyped, specifically to
+//! eliminate transcription risk on the one file whose exact logic and
+//! test assertions actually matter.
+//!
+//! Every other module (`environment`, `agent`, `concentration`,
+//! `orchestration`, `interaction`, `profiling`) is a from-scratch
+//! reconstruction, built the same way `mitonano_orchestrator`'s
+//! `coordinator.rs` was: constrained by `unified_engine.rs`'s exact call
+//! sites (which fix every function signature, argument order, and field
+//! name used) and validated against `unified_engine.rs`'s own real test
+//! module, which was compiled and run for real, not just written to look
+//! plausible. That test module includes several hard, specific numeric
+//! tolerances — mass conservation to 1e-9 relative error over hundreds of
+//! ticks with every transfer pathway simultaneously active, an exact
+//! bookkeeping identity (`total_combined_mass == C0 - cumulative_eliminated`)
+//! under full elimination, index-vs-brute-force agreement to 1e-9, and
+//! profiled/parallel result parity to 1e-12/1e-6 — which is what actually
+//! disciplined the reconstruction's internal formulas (decay-split
+//! proportions, diffusion-flux symmetry, exchange antisymmetry) rather
+//! than any of it being guessed freeform. See `unified_engine.rs`'s own
+//! module docs for its build-and-run history and this crate's overall
+//! test output.
+//!
+//! One thing genuinely underdetermined by the verbatim file, and
+//! therefore a real design choice made here rather than a recovery of
+//! original intent: `environment.rs`'s reflecting-boundary policy for
+//! agent motion. See that module's docs for why reflecting was chosen
+//! over clamping or periodic wrapping.
+//!
+//! ## Extensions beyond the verbatim tick loop
+//!
+//! `kinetics` (saturable Michaelis-Menten uptake), `chemotaxis`
+//! (gradient-biased drift), `population` (stochastic fission/fusion), and
+//! `mobility` (two-state mobile/bound kinetics) are physics extensions
+//! added after the original build, usable only through a caller that
+//! reimplements the per-tick sequence itself rather than calling
+//! `UnifiedEngine::run` directly — `unified_engine.rs`'s own inline,
+//! linear uptake formula, fixed `AgentParams.drift`, fixed-length
+//! `Vec<Agent>` owned for the duration of a `run` call, and total absence
+//! of any mobility-switching call can't be substituted, resized, or
+//! extended from inside `run` without modifying that verbatim file. See
+//! each module's own docs for why, and `mitonano_federated`'s `lib.rs`
+//! for the caller that actually uses them.
+
+pub mod agent;
+pub mod chemotaxis;
+pub mod concentration;
+pub mod environment;
+pub mod interaction;
+pub mod kinetics;
+pub mod mobility;
+pub mod orchestration;
+pub mod population;
+pub mod profiling;
+pub mod unified_engine;
+
+pub use agent::{Agent, AgentParams, MobilityState};
+pub use chemotaxis::{chemotactic_drift, ChemotaxisParams};
+pub use concentration::{ConcentrationField, XFace};
+pub use environment::Bounds;
+pub use interaction::InteractionParams;
+pub use kinetics::{saturable_uptake_amount, SaturableUptakeParams};
+pub use mobility::{maybe_toggle_mobility, sample_stationary_state, TwoStateParams};
+pub use orchestration::SpatialIndex;
+pub use population::{event_fires, event_probability, merge_payload, mutation_fires, split_payload, FissionParams, FusionParams, MutationParams};
+pub use profiling::ProfileReport;
+pub use unified_engine::{UnifiedEngine, UnifiedTickStats};
