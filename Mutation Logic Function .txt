@@ -1,0 +1,256 @@
+//! Stochastic agent fission (division) and fusion (merging) — the most
+//! biologically distinctive behavior missing from a population of
+//! otherwise-immutable agents. Real mitochondria constantly undergo
+//! fission and fusion; everything else in this crate models a fixed
+//! population's motion, decay, and exchange, but never its size changing.
+//!
+//! Like `kinetics` and `chemotaxis`, this is usable only through a caller
+//! that reimplements the per-tick sequence itself rather than calling
+//! `UnifiedEngine::run` directly — `unified_engine.rs`'s own tick loop
+//! owns a fixed-length `Vec<Agent>` for the duration of a `run` call and
+//! has no mechanism to insert or remove elements mid-run, and it's
+//! verbatim, so it can't gain one. See `mitonano_federated`'s `lib.rs`
+//! for the caller that actually creates and destroys agents using these
+//! primitives.
+//!
+//! This module supplies the *pure, stochastic decision* functions
+//! (fires or doesn't, given a rate and `dt`) and the *pure bookkeeping*
+//! functions (how a payload splits, how two payloads merge) — every
+//! piece that's meaningfully testable in isolation, independent of
+//! population management, id assignment, or spatial pairing, all of
+//! which are federated-layer concerns (see `mitonano_federated::lib`'s
+//! own fission/fusion phase docs).
+
+use crate::agent::AgentParams;
+use rand::Rng;
+
+/// Optional "mutation on division" extension to fission, added
+/// specifically to compose with the heterogeneous-population extension
+/// (`Agent::phenotype`, `Agent::effective_params`): with probability
+/// `probability`, the newly-created daughter (never the parent) receives
+/// `damaged_phenotype` as its own `phenotype` override instead of
+/// inheriting the parent's — the concrete mechanism the biological
+/// roadmap review that motivated the heterogeneous-population extension
+/// named directly ("fission could probabilistically produce a damaged
+/// daughter"). Named `damaged_phenotype` to match that framing, but
+/// nothing about the mechanism itself is specific to "damage" — it's
+/// just an `AgentParams` a caller supplies, and could equally model any
+/// other divergent daughter phenotype.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MutationParams {
+    /// Per-fission-event probability (not a Poisson rate like
+    /// `FissionParams::rate` — this is checked once per division, not
+    /// once per tick) that the new daughter gets `damaged_phenotype`
+    /// instead of inheriting the parent's phenotype.
+    pub probability: f64,
+    pub damaged_phenotype: AgentParams,
+}
+
+/// Parameters governing stochastic agent fission (division).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FissionParams {
+    /// Per-unit-time probability rate of an agent dividing (a Poisson
+    /// process rate — NOT itself a per-tick probability; see
+    /// [`fission_probability`] for the exact conversion).
+    pub rate: f64,
+    /// Fraction of the parent's payload the first daughter keeps; the
+    /// second daughter gets the remainder. Must be in `(0.0, 1.0)`;
+    /// `0.5` is symmetric division.
+    pub payload_fraction: f64,
+    /// Starting id for agents created by fission. The caller must choose
+    /// this above any id it will ever pass to `add_agent` directly, to
+    /// avoid collisions — this module has no way to know what ids a
+    /// caller has already used or plans to use.
+    pub next_generated_id: u64,
+    /// When `Some`, every division rolls a chance (see
+    /// [`MutationParams::probability`]) that the new daughter's phenotype
+    /// diverges from the parent's rather than inheriting it. `None`
+    /// (the default) means every daughter always inherits the parent's
+    /// `phenotype` exactly — see `mitonano_federated`'s `lib.rs` for the
+    /// caller that implements the inheritance/mutation logic itself
+    /// (this struct only carries the *parameters*, the same "primitive
+    /// vs. caller" split every other extension in this crate uses).
+    pub mutation: Option<MutationParams>,
+}
+
+/// Parameters governing agent fusion (merging).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FusionParams {
+    /// Two agents within this distance of each other are *candidates*
+    /// for fusion — being in range doesn't guarantee fusion; see `rate`.
+    pub radius: f64,
+    /// Per-unit-time probability rate that a qualifying (in-range) pair
+    /// actually fuses (a Poisson process rate, same convention as
+    /// `FissionParams::rate`).
+    pub rate: f64,
+}
+
+/// Rolls whether a `MutationParams`-governed mutation fires for one
+/// division event: a plain Bernoulli draw against `probability` (not a
+/// Poisson-process rate like [`event_fires`] uses — mutation is checked
+/// once per division event, not once per tick, so there's no `dt` to
+/// convert against).
+pub fn mutation_fires<R: Rng + ?Sized>(params: &MutationParams, rng: &mut R) -> bool {
+    rng.gen::<f64>() < params.probability
+}
+
+/// The exact probability that a Poisson process with rate `rate` fires at
+/// least once during an interval of length `dt`: `1 - exp(-rate*dt)`.
+/// Used for both fission and fusion decisions.
+///
+/// Deliberately *not* the small-`dt` approximation `rate*dt` (which is
+/// only a first-order Taylor expansion of this and can exceed 1.0 for
+/// large `rate*dt`, an invalid probability): this is the exact result for
+/// a memoryless Poisson process, so it stays correct at any `dt`, and
+/// composing many small steps of this reproduces exactly the same
+/// aggregate probability as one big step would (both work out to
+/// `1 - exp(-rate*T)` over total elapsed time `T`) — the property
+/// `tests::fission_probability_composes_correctly_across_multiple_steps`
+/// checks directly.
+pub fn event_probability(rate: f64, dt: f64) -> f64 {
+    1.0 - (-rate * dt).exp()
+}
+
+/// Rolls a single Bernoulli draw against [`event_probability`] to decide
+/// whether an event (fission or fusion) fires during this step.
+pub fn event_fires<R: Rng + ?Sized>(rate: f64, dt: f64, rng: &mut R) -> bool {
+    rng.gen::<f64>() < event_probability(rate, dt)
+}
+
+/// Splits `payload` into two daughter amounts using `fraction` for the
+/// first. The second is computed as `payload - first`, not
+/// `payload * (1.0 - fraction)` — those are algebraically equal but not
+/// always bit-identical in floating point, and computing the second as a
+/// subtraction from the first guarantees the two *always* sum to exactly
+/// `payload`, not merely very close to it. This is what makes fission
+/// exactly payload-conservative by construction, not just conservative
+/// modulo rounding.
+pub fn split_payload(payload: f64, fraction: f64) -> (f64, f64) {
+    let first = payload * fraction;
+    let second = payload - first;
+    (first, second)
+}
+
+/// Merges two payloads into one (fusion) — exists mainly for symmetry
+/// with [`split_payload`] and to name the operation explicitly at call
+/// sites, since `a + b` alone doesn't read as "this is the fusion
+/// bookkeeping step."
+pub fn merge_payload(a: f64, b: f64) -> f64 {
+    a + b
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+
+    #[test]
+    fn mutation_fires_respects_the_configured_probability_over_many_draws() {
+        let damaged = AgentParams { drift: [0.0, 0.0, 0.0], diffusion_coeff: 0.0, k_elim: 0.5, k_release: 0.0 };
+        let params = MutationParams { probability: 0.2, damaged_phenotype: damaged };
+        let mut rng = StdRng::seed_from_u64(555);
+        let n = 20_000;
+        let fired = (0..n).filter(|_| mutation_fires(&params, &mut rng)).count();
+        let observed_p = fired as f64 / n as f64;
+        let expected_p = 0.2;
+        let se = (expected_p * (1.0 - expected_p) / n as f64).sqrt();
+        assert!((observed_p - expected_p).abs() < 6.0 * se, "observed={observed_p} vs expected={expected_p} (6*SE={})", 6.0 * se);
+    }
+
+    #[test]
+    fn event_probability_is_zero_for_zero_rate_or_zero_dt() {
+        assert_eq!(event_probability(0.0, 1.0), 0.0);
+        assert_eq!(event_probability(0.5, 0.0), 0.0);
+    }
+
+    #[test]
+    fn event_probability_approaches_one_for_large_rate_dt() {
+        let p = event_probability(10.0, 5.0); // rate*dt = 50, e^-50 ~ 0
+        assert!(p > 0.999999);
+        assert!(p <= 1.0);
+    }
+
+    #[test]
+    fn event_probability_never_exceeds_one_even_for_huge_rate_dt() {
+        // The small-dt approximation rate*dt would give 1000.0 here — an
+        // invalid probability. The exact Poisson formula must not.
+        let p = event_probability(100.0, 10.0);
+        assert!(p <= 1.0);
+        assert!(p > 0.9999999999);
+    }
+
+    #[test]
+    fn event_probability_matches_the_small_dt_approximation_for_small_rate_dt() {
+        // For rate*dt << 1, 1-exp(-x) ~ x - x^2/2 + ... -- should closely
+        // track the linear approximation used elsewhere in this crate's
+        // small-dt formulas (e.g. the linear uptake formula).
+        let rate = 0.1;
+        let dt = 0.001; // rate*dt = 0.0001
+        let exact = event_probability(rate, dt);
+        let approx = rate * dt;
+        assert!((exact - approx).abs() < 1e-7, "exact={exact} approx={approx}");
+    }
+
+    /// The closed-form property that justifies using the exact Poisson
+    /// formula instead of the linear approximation: composing many small
+    /// steps must give the same aggregate probability as one big step
+    /// over the same total time, `1 - exp(-rate*T)`. This would *not*
+    /// hold for the naive `rate*dt` approximation once `rate*dt` isn't
+    /// tiny (compounding `(1 - rate*dt)^n` doesn't equal
+    /// `1 - rate*T` in general).
+    #[test]
+    fn fission_probability_composes_correctly_across_multiple_steps() {
+        let rate = 0.5;
+        let big_dt = 2.0;
+        let one_step_prob = event_probability(rate, big_dt);
+
+        // Survival probability (no event) over n small steps must equal
+        // survival probability over one big step of the same total time.
+        let n_steps = 200;
+        let small_dt = big_dt / n_steps as f64;
+        let small_step_survival = 1.0 - event_probability(rate, small_dt);
+        let composed_survival = small_step_survival.powi(n_steps);
+        let composed_prob = 1.0 - composed_survival;
+
+        assert!((composed_prob - one_step_prob).abs() < 1e-9, "composed={composed_prob} vs one_step={one_step_prob}");
+    }
+
+    #[test]
+    fn split_payload_always_sums_to_exactly_the_original() {
+        for payload in [1.0, 7.5, 100.0, 0.001, 999.999] {
+            for fraction in [0.1, 0.5, 0.9, 0.99] {
+                let (a, b) = split_payload(payload, fraction);
+                assert_eq!(a + b, payload, "payload={payload} fraction={fraction}: {a} + {b} != {payload}");
+            }
+        }
+    }
+
+    #[test]
+    fn split_payload_with_fraction_half_is_symmetric() {
+        let (a, b) = split_payload(10.0, 0.5);
+        assert_eq!(a, 5.0);
+        assert_eq!(b, 5.0);
+    }
+
+    #[test]
+    fn merge_payload_is_the_exact_inverse_of_split_payload() {
+        let original = 42.5;
+        let (a, b) = split_payload(original, 0.37);
+        assert_eq!(merge_payload(a, b), original);
+    }
+
+    #[test]
+    fn event_fires_respects_the_underlying_probability_over_many_draws() {
+        let rate = 1.0;
+        let dt = 0.1; // event_probability ~ 0.0952
+        let expected_p = event_probability(rate, dt);
+        let mut rng = StdRng::seed_from_u64(42);
+        let n = 20_000;
+        let fired = (0..n).filter(|_| event_fires(rate, dt, &mut rng)).count();
+        let observed_p = fired as f64 / n as f64;
+        // Standard error of a Bernoulli proportion estimate.
+        let se = (expected_p * (1.0 - expected_p) / n as f64).sqrt();
+        assert!((observed_p - expected_p).abs() < 6.0 * se, "observed={observed_p} vs expected={expected_p} (6*SE={})", 6.0 * se);
+    }
+}
