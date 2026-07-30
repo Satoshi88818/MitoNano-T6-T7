@@ -1,0 +1,340 @@
+//! A single mobile, payload-carrying agent: SDE motion plus first-order
+//! decay split exactly between release (back into the field) and
+//! elimination (removed from the system).
+//!
+//! See `lib.rs`'s module docs for this crate's overall provenance/scope
+//! note, and `environment.rs`'s module docs for the same caveat about
+//! `Bounds`'s behavior applying here too: `unified_engine.rs` (the one
+//! verbatim file) pins down `advance_position`'s and `decay_and_release`'s
+//! *signatures* and how their *outputs* are used, but not their internal
+//! formulas — those are reconstructed to satisfy the real, hard-tolerance
+//! tests in `unified_engine.rs`'s own test module (mass conservation to
+//! 1e-9, index-vs-brute-force agreement to 1e-9, profiled/parallel parity
+//! to 1e-12/1e-6).
+
+use crate::environment::Bounds;
+use rand::Rng;
+
+/// An agent's current motion state, for the optional two-state
+/// mobile/bound kinetics extension (`mitonano_core::mobility`). Defaults
+/// to `Mobile` in `Agent::new` — a caller that never touches this field
+/// or `mitonano_core::mobility` at all sees `advance_position` behave
+/// exactly as it always has (see that method's own docs), which is what
+/// keeps this addition from disturbing any of this crate's existing
+/// behavior or tests, verbatim `unified_engine.rs` included.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MobilityState {
+    Mobile,
+    Bound,
+}
+
+use crate::kinetics::UptakeKinetics;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Agent {
+    pub position: [f64; 3],
+    pub payload: f64,
+    pub mobility: MobilityState,
+    /// Per-agent physics override, for the optional heterogeneous-
+    /// population extension. `None` (the default) means this agent uses
+    /// whatever `AgentParams` its caller supplies externally — for every
+    /// verbatim `unified_engine.rs` caller, that's the single
+    /// engine-wide `UnifiedEngine.params` every agent has always shared.
+    /// `Some(params)` lets a caller substitute different physics for
+    /// *this* agent specifically (a different `k_elim` to model a
+    /// damaged/senescent mitochondrion's faster clearance, a different
+    /// `diffusion_coeff` to model a different nanoparticle formulation's
+    /// mobility, etc.) without needing per-agent tracking of which
+    /// override applies anywhere outside the agent itself.
+    ///
+    /// Like `mobility`, this field exists but is inert unless a caller
+    /// actually resolves it via [`Agent::effective_params`] before
+    /// calling `advance_position`/`decay_and_release` — neither of those
+    /// methods reads this field themselves, since `unified_engine.rs`'s
+    /// verbatim call sites always pass their own engine-wide `&AgentParams`
+    /// directly and have no notion of per-agent overrides at all. See
+    /// `mitonano_federated`'s `lib.rs` for the caller that resolves it.
+    pub phenotype: Option<AgentParams>,
+    /// The uptake analogue of `phenotype`: `None` (the default) means
+    /// this agent uses whatever node-wide uptake configuration its
+    /// caller supplies (linear `k_uptake` or `saturable_uptake`, both
+    /// living at `mitonano_federated::FederatedEngineConfig`'s level
+    /// rather than inside `AgentParams` at all, which is why this is a
+    /// separate field rather than folded into `phenotype`). `Some(k)`
+    /// lets a caller give *this* agent its own uptake kinetics — a
+    /// different nanoparticle formulation's own uptake profile,
+    /// independent of whatever the node's default is. See
+    /// `mitonano_core::kinetics::uptake_amount`'s own docs for the
+    /// single resolution function that reads this.
+    pub uptake_override: Option<UptakeKinetics>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AgentParams {
+    pub drift: [f64; 3],
+    /// **Not** the same physical quantity as
+    /// `ConcentrationField::step`'s `field_diffusion_coeff` argument,
+    /// despite the identical name — a real naming asymmetry, surfaced by
+    /// `tests/closed_form_physics.rs`'s
+    /// `free_diffusion_mean_squared_displacement_matches_the_closed_form_prediction`,
+    /// documented here rather than left implicit.
+    ///
+    /// Per `advance_position` below, each SDE step adds independent noise
+    /// of variance `diffusion_coeff^2 * dt` per axis, so a driftless
+    /// agent's per-axis position variance after elapsed time `T` is
+    /// exactly `diffusion_coeff^2 * T`. `field_diffusion_coeff` instead
+    /// plugs directly into the discretized heat equation
+    /// `dc/dt = D * d^2c/dx^2` as the classical coefficient `D`, whose
+    /// point-source solution's variance grows as `2 * D * t` — the more
+    /// commonly quoted convention. In that convention, this field
+    /// corresponds to an effective `D = diffusion_coeff^2 / 2`, not
+    /// `diffusion_coeff` itself. See [`AgentParams::effective_diffusion_constant`]
+    /// and [`AgentParams::motion_diffusion_coeff_for`] to convert between
+    /// the two conventions explicitly, rather than by hand.
+    pub diffusion_coeff: f64,
+    pub k_elim: f64,
+    pub k_release: f64,
+}
+
+impl AgentParams {
+    /// Converts this `diffusion_coeff` into the classical Brownian-motion
+    /// diffusion constant `D` (the convention `field_diffusion_coeff`
+    /// already uses directly, where `Var(X_t) = 2*D*t`) — see the
+    /// `diffusion_coeff` field's own docs for why these two parameters
+    /// are not interchangeable despite the shared name. Useful for
+    /// comparing an `AgentParams`'s motion spread rate against a
+    /// `ConcentrationField`'s diffusion rate on equal footing, e.g. when
+    /// deciding whether agent motion or field diffusion dominates the
+    /// overall spread of mass through a simulation.
+    pub fn effective_diffusion_constant(&self) -> f64 {
+        self.diffusion_coeff * self.diffusion_coeff / 2.0
+    }
+
+    /// The inverse of [`AgentParams::effective_diffusion_constant`]:
+    /// given a classical diffusion constant `D` (e.g. a
+    /// `field_diffusion_coeff` value, or a target spread rate specified
+    /// in the `Var(X_t) = 2*D*t` convention), returns the
+    /// `diffusion_coeff` value that reproduces that same rate for agent
+    /// motion. Lets a caller configure both subsystems from one shared
+    /// physical diffusion rate without doing the `sqrt(2*D)` conversion
+    /// by hand — see `tests::diffusion_coeff_conversions_round_trip` for
+    /// the identity this satisfies.
+    pub fn motion_diffusion_coeff_for(classical_diffusion_constant: f64) -> f64 {
+        (2.0 * classical_diffusion_constant).sqrt()
+    }
+}
+
+impl Agent {
+    pub fn new(position: [f64; 3], payload: f64) -> Self {
+        Agent { position, payload, mobility: MobilityState::Mobile, phenotype: None, uptake_override: None }
+    }
+
+    /// Resolves which `AgentParams` this agent should actually be
+    /// stepped with: its own `phenotype` override if set, otherwise
+    /// `fallback` (typically the caller's engine-wide default). A pure,
+    /// trivial function, but factored out and independently tested
+    /// (`tests::effective_params_prefers_the_phenotype_override`,
+    /// `tests::effective_params_falls_back_to_the_given_default_when_none`)
+    /// specifically so the resolution rule itself — override wins,
+    /// fallback otherwise — is pinned down and checked in one place,
+    /// rather than reimplemented inline at every call site that needs it.
+    pub fn effective_params(&self, fallback: &AgentParams) -> AgentParams {
+        self.phenotype.unwrap_or(*fallback)
+    }
+
+    /// One Euler-Maruyama SDE step: `position += drift * dt + diffusion_coeff
+    /// * sqrt(dt) * N(0,1)` per axis (independent noise per axis), then
+    /// reflected back inside `bounds` (see `environment.rs`'s module docs
+    /// for why reflecting specifically). `N(0,1)` is drawn via Box-Muller
+    /// directly from `rng.gen::<f64>()`, avoiding a `rand_distr`
+    /// dependency for a single distribution.
+    ///
+    /// A no-op — no motion, no RNG draws — when `self.mobility` is
+    /// `MobilityState::Bound` (see `mitonano_core::mobility`'s module
+    /// docs for the two-state kinetics this supports). Every existing
+    /// caller, `unified_engine.rs` included, only ever constructs agents
+    /// via `Agent::new`, which defaults to `Mobile`, so this check is
+    /// unreachable — and therefore behaviorally invisible — unless a
+    /// caller deliberately sets `mobility` to `Bound` itself, which
+    /// nothing in this crate's own code does.
+    pub fn advance_position<R: Rng + ?Sized>(&mut self, params: &AgentParams, bounds: &Bounds, dt: f64, rng: &mut R) {
+        if self.mobility == MobilityState::Bound {
+            return;
+        }
+        let noise_scale = params.diffusion_coeff * dt.sqrt();
+        for axis in 0..3 {
+            let noise = if noise_scale > 0.0 { noise_scale * standard_normal(rng) } else { 0.0 };
+            self.position[axis] += params.drift[axis] * dt + noise;
+        }
+        bounds.reflect(&mut self.position);
+    }
+
+    /// First-order decay of `payload` at combined rate `k_release +
+    /// k_elim` over `dt`, using the exact exponential decay
+    /// `decayed = payload * (1 - exp(-(k_release + k_elim) * dt))`
+    /// (rather than a first-order Euler approximation `payload * rate *
+    /// dt`) so `payload` can never go negative even for a large `dt *
+    /// rate`. `decayed` is then split into `released` and `eliminated`
+    /// in exact proportion to `k_release` and `k_elim`, which guarantees
+    /// `released + eliminated == decayed` exactly (both share the same
+    /// `decayed / rate` factor) — the identity
+    /// `total_combined_mass(t) == C0 - cumulative_eliminated(t)` that
+    /// `unified_engine.rs`'s own strongest test checks to 1e-9 depends
+    /// directly on that exactness.
+    pub fn decay_and_release(&mut self, params: &AgentParams, dt: f64) -> (f64, f64) {
+        let rate = params.k_release + params.k_elim;
+        if rate <= 0.0 || self.payload <= 0.0 {
+            return (0.0, 0.0);
+        }
+        let decayed = self.payload * (1.0 - (-rate * dt).exp());
+        let released = decayed * (params.k_release / rate);
+        let eliminated = decayed * (params.k_elim / rate);
+        self.payload -= decayed;
+        (released, eliminated)
+    }
+}
+
+fn standard_normal<R: Rng + ?Sized>(rng: &mut R) -> f64 {
+    // Box-Muller transform.
+    let u1: f64 = rng.gen::<f64>().max(f64::MIN_POSITIVE); // avoid ln(0.0)
+    let u2: f64 = rng.gen::<f64>();
+    (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+
+    #[test]
+    fn advance_position_with_zero_diffusion_and_drift_only_moves_deterministically() {
+        let params = AgentParams { drift: [1.0, -2.0, 0.5], diffusion_coeff: 0.0, k_elim: 0.0, k_release: 0.0 };
+        let bounds = Bounds::new([-100.0, -100.0, -100.0], [100.0, 100.0, 100.0]);
+        let mut agent = Agent::new([0.0, 0.0, 0.0], 1.0);
+        let mut rng = StdRng::seed_from_u64(1);
+        agent.advance_position(&params, &bounds, 2.0, &mut rng);
+        assert_eq!(agent.position, [2.0, -4.0, 1.0]);
+    }
+
+    #[test]
+    fn advance_position_reflects_off_a_wall() {
+        let params = AgentParams { drift: [5.0, 0.0, 0.0], diffusion_coeff: 0.0, k_elim: 0.0, k_release: 0.0 };
+        let bounds = Bounds::new([0.0, 0.0, 0.0], [4.0, 100.0, 100.0]);
+        let mut agent = Agent::new([3.0, 0.0, 0.0], 1.0);
+        let mut rng = StdRng::seed_from_u64(1);
+        agent.advance_position(&params, &bounds, 1.0, &mut rng); // would move to x=8, must reflect
+        assert!(agent.position[0] >= 0.0 && agent.position[0] <= 4.0);
+    }
+
+    #[test]
+    fn decay_and_release_splits_exactly_in_proportion_to_rates() {
+        let params = AgentParams { drift: [0.0, 0.0, 0.0], diffusion_coeff: 0.0, k_elim: 0.02, k_release: 0.08 };
+        let mut agent = Agent::new([0.0, 0.0, 0.0], 10.0);
+        let (released, eliminated) = agent.decay_and_release(&params, 1.0);
+        // k_release:k_elim = 4:1, so released should be 4x eliminated.
+        assert!((released - 4.0 * eliminated).abs() < 1e-12);
+        assert!((released + eliminated - (10.0 - agent.payload)).abs() < 1e-12, "released + eliminated must equal exactly the payload lost");
+    }
+
+    #[test]
+    fn decay_and_release_never_produces_negative_payload_even_for_large_dt() {
+        let params = AgentParams { drift: [0.0, 0.0, 0.0], diffusion_coeff: 0.0, k_elim: 0.5, k_release: 0.5 };
+        let mut agent = Agent::new([0.0, 0.0, 0.0], 10.0);
+        agent.decay_and_release(&params, 1000.0); // huge dt
+        assert!(agent.payload >= 0.0, "payload went negative: {}", agent.payload);
+        assert!(agent.payload < 1e-6, "payload should have decayed to ~0 over such a large dt");
+    }
+
+    #[test]
+    fn decay_and_release_is_a_no_op_when_both_rates_are_zero() {
+        let params = AgentParams { drift: [0.0, 0.0, 0.0], diffusion_coeff: 0.0, k_elim: 0.0, k_release: 0.0 };
+        let mut agent = Agent::new([0.0, 0.0, 0.0], 7.0);
+        let (released, eliminated) = agent.decay_and_release(&params, 1.0);
+        assert_eq!((released, eliminated), (0.0, 0.0));
+        assert_eq!(agent.payload, 7.0);
+    }
+
+    #[test]
+    fn agent_new_defaults_to_no_uptake_override() {
+        let agent = Agent::new([1.0, 2.0, 3.0], 5.0);
+        assert_eq!(agent.uptake_override, None);
+    }
+
+    #[test]
+    fn agent_new_defaults_to_no_phenotype_override() {
+        let agent = Agent::new([1.0, 2.0, 3.0], 5.0);
+        assert_eq!(agent.phenotype, None);
+    }
+
+    #[test]
+    fn effective_params_falls_back_to_the_given_default_when_none() {
+        let agent = Agent::new([0.0, 0.0, 0.0], 1.0);
+        let fallback = AgentParams { drift: [1.0, 0.0, 0.0], diffusion_coeff: 0.5, k_elim: 0.1, k_release: 0.2 };
+        assert_eq!(agent.effective_params(&fallback), fallback);
+    }
+
+    #[test]
+    fn effective_params_prefers_the_phenotype_override() {
+        let mut agent = Agent::new([0.0, 0.0, 0.0], 1.0);
+        let override_params = AgentParams { drift: [9.0, 9.0, 9.0], diffusion_coeff: 3.0, k_elim: 0.9, k_release: 0.9 };
+        agent.phenotype = Some(override_params);
+        let fallback = AgentParams { drift: [1.0, 0.0, 0.0], diffusion_coeff: 0.5, k_elim: 0.1, k_release: 0.2 };
+        assert_eq!(agent.effective_params(&fallback), override_params);
+    }
+
+    #[test]
+    fn agent_new_defaults_to_mobile() {
+        let agent = Agent::new([1.0, 2.0, 3.0], 5.0);
+        assert_eq!(agent.mobility, MobilityState::Mobile);
+    }
+
+    #[test]
+    fn advance_position_is_a_no_op_when_bound() {
+        let params = AgentParams { drift: [5.0, 5.0, 5.0], diffusion_coeff: 2.0, k_elim: 0.0, k_release: 0.0 };
+        let bounds = Bounds::new([-100.0, -100.0, -100.0], [100.0, 100.0, 100.0]);
+        let mut agent = Agent::new([1.0, 2.0, 3.0], 1.0);
+        agent.mobility = MobilityState::Bound;
+        let mut rng = StdRng::seed_from_u64(1);
+        agent.advance_position(&params, &bounds, 1.0, &mut rng);
+        assert_eq!(agent.position, [1.0, 2.0, 3.0], "a bound agent must not move even with strong drift and diffusion configured");
+    }
+
+    #[test]
+    fn effective_diffusion_constant_matches_the_classical_convention_definition() {
+        let params = AgentParams { drift: [0.0, 0.0, 0.0], diffusion_coeff: 0.6, k_elim: 0.0, k_release: 0.0 };
+        // Var(X_T) = diffusion_coeff^2 * T (this crate's convention, see
+        // tests/closed_form_physics.rs) must equal 2*D*T (classical
+        // convention) for the SAME physical process, which requires
+        // exactly D = diffusion_coeff^2 / 2.
+        let expected_d = 0.6 * 0.6 / 2.0;
+        assert!((params.effective_diffusion_constant() - expected_d).abs() < 1e-15);
+    }
+
+    #[test]
+    fn diffusion_coeff_conversions_round_trip() {
+        for diffusion_coeff in [0.1, 0.6, 1.0, 2.5] {
+            let params = AgentParams { drift: [0.0, 0.0, 0.0], diffusion_coeff, k_elim: 0.0, k_release: 0.0 };
+            let d = params.effective_diffusion_constant();
+            let recovered = AgentParams::motion_diffusion_coeff_for(d);
+            assert!(
+                (recovered - diffusion_coeff).abs() < 1e-12,
+                "round trip failed: diffusion_coeff={diffusion_coeff} -> D={d} -> recovered={recovered}"
+            );
+        }
+    }
+
+    /// Confirms the conversion helper actually produces physically
+    /// matching spread rates between the two subsystems, not just an
+    /// algebraically-consistent round trip: an `AgentParams` built via
+    /// `motion_diffusion_coeff_for(D)` and a `ConcentrationField` diffused
+    /// with that same classical `D` should now be expressible on equal
+    /// footing — `effective_diffusion_constant()` recovers exactly `D`.
+    #[test]
+    fn motion_diffusion_coeff_for_produces_the_requested_classical_rate() {
+        let classical_d = 0.18; // an arbitrary field_diffusion_coeff-style value
+        let diffusion_coeff = AgentParams::motion_diffusion_coeff_for(classical_d);
+        let params = AgentParams { drift: [0.0, 0.0, 0.0], diffusion_coeff, k_elim: 0.0, k_release: 0.0 };
+        assert!((params.effective_diffusion_constant() - classical_d).abs() < 1e-12);
+    }
+}
