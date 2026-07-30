@@ -1,0 +1,165 @@
+//! Saturable uptake kinetics (Michaelis-Menten), an alternative to the
+//! linear `k_uptake * c * dt` uptake formula built into `unified_engine.rs`
+//! (verbatim, unmodified). Real receptor/carrier-mediated uptake usually
+//! saturates as local concentration grows — a fixed number of transporters
+//! can only move so much mass per unit time regardless of how much
+//! substrate is available — which linear uptake cannot represent (it
+//! grows without bound as concentration grows).
+//!
+//! `unified_engine.rs`'s own tick loop computes uptake inline
+//! (`k_uptake * c_local * dt`) and cannot be changed — see this crate's
+//! `lib.rs` module docs for why. `mitonano_federated` reimplements the
+//! per-tick sequence itself (rather than calling `UnifiedEngine::run`
+//! directly) specifically to allow substituting in a different uptake
+//! formula at that call site — this module is what it substitutes in.
+
+/// Michaelis-Menten kinetics parameters: `v_max` is the maximum uptake
+/// rate (mass per unit time) as concentration grows without bound;
+/// `k_m` is the concentration at which uptake rate is exactly half of
+/// `v_max` (the standard biochemical definition).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SaturableUptakeParams {
+    pub v_max: f64,
+    pub k_m: f64,
+}
+
+/// Mass taken up over `dt` at local concentration `c_local`:
+/// `v_max * c_local / (k_m + c_local) * dt`. Two closed-form limiting
+/// behaviors this satisfies (both checked directly in this module's
+/// tests, not just asserted in a comment): at `c_local << k_m`, this
+/// reduces to approximately linear uptake `(v_max/k_m) * c_local * dt`;
+/// at `c_local >> k_m`, it saturates toward `v_max * dt` regardless of
+/// how much higher `c_local` goes.
+///
+/// Returns exactly `0.0` when `c_local <= 0.0` (the numerator is zero, so
+/// this falls out of the formula naturally — no special case needed for
+/// correctness, though `c_local < 0.0` is guarded against explicitly since
+/// concentration should never legitimately go negative and silently
+/// returning a nonsensical negative "uptake" for a caller's bug would be
+/// worse than an explicit, obvious zero).
+pub fn saturable_uptake_amount(params: &SaturableUptakeParams, c_local: f64, dt: f64) -> f64 {
+    if c_local <= 0.0 {
+        return 0.0;
+    }
+    params.v_max * c_local / (params.k_m + c_local) * dt
+}
+
+/// Gap 3 from the physics roadmap review: real populations aren't
+/// uniform in their uptake behavior either — "different nanoparticle
+/// formulations have different diffusion/uptake profiles" was the
+/// original framing. This unifies the linear and saturable formulas
+/// behind one type specifically so a *per-agent* uptake choice
+/// (`mitonano_core::agent::Agent::uptake_override`) can be resolved with
+/// one function ([`uptake_amount`]) regardless of which kind of kinetics
+/// a given agent uses, the same "resolve once, use uniformly" pattern
+/// `Agent::effective_params`/`AgentParams` already established for
+/// motion and decay/release.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum UptakeKinetics {
+    /// The original linear formula: `k_uptake * c_local * dt`, unbounded
+    /// as concentration grows.
+    Linear(f64),
+    /// The saturable Michaelis-Menten formula (see [`saturable_uptake_amount`]).
+    Saturable(SaturableUptakeParams),
+}
+
+/// Resolves mass taken up over `dt` at local concentration `c_local`
+/// under whichever kinetics `kinetics` specifies — the single call site
+/// `mitonano_federated` uses regardless of whether a given agent's uptake
+/// is linear, saturable, or (most commonly) just the node-wide default
+/// (see `Agent::uptake_override`'s own docs for how the "which kinetics
+/// applies to this agent" resolution itself works, one level up from this
+/// function).
+pub fn uptake_amount(kinetics: &UptakeKinetics, c_local: f64, dt: f64) -> f64 {
+    match kinetics {
+        UptakeKinetics::Linear(k_uptake) => (k_uptake * c_local * dt).max(0.0),
+        UptakeKinetics::Saturable(params) => saturable_uptake_amount(params, c_local, dt),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uptake_amount_linear_matches_the_original_formula_exactly() {
+        let kinetics = UptakeKinetics::Linear(0.3);
+        assert_eq!(uptake_amount(&kinetics, 2.0, 0.5), 0.3 * 2.0 * 0.5);
+    }
+
+    #[test]
+    fn uptake_amount_linear_never_goes_negative_for_negative_concentration() {
+        let kinetics = UptakeKinetics::Linear(0.3);
+        assert_eq!(uptake_amount(&kinetics, -5.0, 1.0), 0.0);
+    }
+
+    #[test]
+    fn uptake_amount_saturable_matches_saturable_uptake_amount_exactly() {
+        let params = SaturableUptakeParams { v_max: 1.5, k_m: 0.4 };
+        let kinetics = UptakeKinetics::Saturable(params);
+        assert_eq!(uptake_amount(&kinetics, 3.0, 0.2), saturable_uptake_amount(&params, 3.0, 0.2));
+    }
+
+    #[test]
+    fn zero_or_negative_concentration_gives_zero_uptake() {
+        let params = SaturableUptakeParams { v_max: 1.0, k_m: 0.5 };
+        assert_eq!(saturable_uptake_amount(&params, 0.0, 1.0), 0.0);
+        assert_eq!(saturable_uptake_amount(&params, -3.0, 1.0), 0.0);
+    }
+
+    #[test]
+    fn uptake_rate_is_exactly_half_v_max_at_c_equals_k_m() {
+        let params = SaturableUptakeParams { v_max: 2.0, k_m: 0.5 };
+        let dt = 1.0;
+        let uptake = saturable_uptake_amount(&params, params.k_m, dt);
+        // v_max * k_m / (k_m + k_m) = v_max / 2, exactly -- the defining
+        // property of k_m, checked directly rather than just asserted.
+        assert!((uptake - params.v_max * dt / 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn approaches_linear_uptake_when_concentration_is_much_smaller_than_k_m() {
+        let v_max = 3.0;
+        let k_m = 100.0;
+        let params = SaturableUptakeParams { v_max, k_m };
+        let dt = 1.0;
+        let c = 0.01; // c << k_m
+        let saturable = saturable_uptake_amount(&params, c, dt);
+        let linear_approx = (v_max / k_m) * c * dt;
+        let rel_err = (saturable - linear_approx).abs() / linear_approx;
+        assert!(rel_err < 0.001, "at c<<k_m, saturable uptake should closely match the linear approximation (rel_err={rel_err})");
+    }
+
+    #[test]
+    fn saturates_toward_v_max_when_concentration_is_much_larger_than_k_m() {
+        let v_max = 3.0;
+        let k_m = 0.1;
+        let params = SaturableUptakeParams { v_max, k_m };
+        let dt = 1.0;
+        let c = 10_000.0; // c >> k_m
+        let uptake = saturable_uptake_amount(&params, c, dt);
+        let rel_err = (uptake - v_max * dt).abs() / (v_max * dt);
+        assert!(rel_err < 0.001, "at c>>k_m, uptake should approach v_max*dt (rel_err={rel_err})");
+    }
+
+    #[test]
+    fn uptake_never_exceeds_v_max_dt_no_matter_how_large_concentration_gets() {
+        let params = SaturableUptakeParams { v_max: 5.0, k_m: 1.0 };
+        let dt = 0.5;
+        for &c in &[1.0, 100.0, 1.0e6, 1.0e12] {
+            let uptake = saturable_uptake_amount(&params, c, dt);
+            assert!(uptake < params.v_max * dt, "uptake={uptake} exceeded v_max*dt={} at c={c}", params.v_max * dt);
+        }
+    }
+
+    #[test]
+    fn uptake_is_monotonically_increasing_in_concentration() {
+        let params = SaturableUptakeParams { v_max: 4.0, k_m: 2.0 };
+        let dt = 1.0;
+        let concentrations = [0.1, 0.5, 1.0, 2.0, 5.0, 20.0, 100.0];
+        let uptakes: Vec<f64> = concentrations.iter().map(|&c| saturable_uptake_amount(&params, c, dt)).collect();
+        for pair in uptakes.windows(2) {
+            assert!(pair[1] > pair[0], "uptake should strictly increase with concentration: {:?}", uptakes);
+        }
+    }
+}
