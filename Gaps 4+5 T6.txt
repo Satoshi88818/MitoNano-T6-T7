@@ -1,0 +1,427 @@
+//! The diffusible field agents release into and withdraw from: a uniform
+//! grid of cell masses, plus an explicit finite-difference diffusion step.
+//!
+//! `nx`/`ny`/`nz` are `pub` because `unified_engine.rs` (verbatim) reads
+//! them directly (`self.field.nx * self.field.ny * self.field.nz` for
+//! `ProfileReport::grid_cells`) — that field visibility is fixed by the
+//! verbatim call site, not a design choice made here.
+
+use crate::environment::Bounds;
+
+pub struct ConcentrationField {
+    pub bounds: Bounds,
+    pub nx: usize,
+    pub ny: usize,
+    pub nz: usize,
+    cell_size: [f64; 3],
+    /// Flattened `nx * ny * nz` grid of cell *mass* (not concentration —
+    /// `sample` divides by cell volume to get concentration; storing mass
+    /// directly, rather than concentration, is what makes `total_mass`
+    /// and the diffusion step's conservation exact regardless of cell
+    /// volume).
+    mass: Vec<f64>,
+}
+
+impl ConcentrationField {
+    pub fn new(bounds: Bounds, nx: usize, ny: usize, nz: usize) -> Self {
+        assert!(nx > 0 && ny > 0 && nz > 0, "ConcentrationField grid dimensions must be positive");
+        let cell_size = [bounds.width(0) / nx as f64, bounds.width(1) / ny as f64, bounds.width(2) / nz as f64];
+        ConcentrationField { bounds, nx, ny, nz, cell_size, mass: vec![0.0; nx * ny * nz] }
+    }
+
+    fn cell_volume(&self) -> f64 {
+        self.cell_size[0] * self.cell_size[1] * self.cell_size[2]
+    }
+
+    fn cell_indices(&self, position: [f64; 3]) -> (usize, usize, usize) {
+        let idx = |p: f64, lo: f64, size: f64, n: usize| -> usize {
+            if size <= 0.0 {
+                return 0;
+            }
+            (((p - lo) / size).floor() as isize).clamp(0, n as isize - 1) as usize
+        };
+        (
+            idx(position[0], self.bounds.min[0], self.cell_size[0], self.nx),
+            idx(position[1], self.bounds.min[1], self.cell_size[1], self.ny),
+            idx(position[2], self.bounds.min[2], self.cell_size[2], self.nz),
+        )
+    }
+
+    fn flat_index(&self, ix: usize, iy: usize, iz: usize) -> usize {
+        ix + iy * self.nx + iz * self.nx * self.ny
+    }
+
+    fn cell_of(&self, position: [f64; 3]) -> usize {
+        let (ix, iy, iz) = self.cell_indices(position);
+        self.flat_index(ix, iy, iz)
+    }
+
+    /// Central-difference gradient of concentration at `position`, using
+    /// each axis's own cell width as the finite-difference step — tied to
+    /// the grid's actual resolution rather than an arbitrary
+    /// caller-supplied step, which matters here specifically: too small a
+    /// step relative to cell width would often land in the *same* cell on
+    /// both sides (since `sample` is piecewise-constant per cell) and
+    /// silently return a zero gradient even in a genuinely sloped region.
+    /// Existing near-boundary clamping in `cell_indices` means this never
+    /// panics, even for a `position` right at the field's edge.
+    pub fn gradient(&self, position: [f64; 3]) -> [f64; 3] {
+        let mut grad = [0.0; 3];
+        for axis in 0..3 {
+            let h = self.cell_size[axis];
+            if h <= 0.0 {
+                continue;
+            }
+            let mut plus = position;
+            plus[axis] += h;
+            let mut minus = position;
+            minus[axis] -= h;
+            grad[axis] = (self.sample(plus) - self.sample(minus)) / (2.0 * h);
+        }
+        grad
+    }
+
+    /// Concentration (mass / cell volume) at `position`'s cell.
+    pub fn sample(&self, position: [f64; 3]) -> f64 {
+        self.mass[self.cell_of(position)] / self.cell_volume()
+    }
+
+    /// Removes up to `desired` mass from `position`'s cell, clamped to
+    /// what's actually available (never goes negative), and returns the
+    /// amount actually removed. This clamp is what makes the withdraw
+    /// pathway self-canceling with `deposit` under all conditions — a
+    /// desired withdrawal larger than the cell holds can't manufacture
+    /// mass from nothing.
+    pub fn withdraw(&mut self, position: [f64; 3], desired: f64) -> f64 {
+        let idx = self.cell_of(position);
+        let available = self.mass[idx].max(0.0);
+        let actual = desired.clamp(0.0, available);
+        self.mass[idx] -= actual;
+        actual
+    }
+
+    pub fn deposit(&mut self, position: [f64; 3], amount: f64) {
+        let idx = self.cell_of(position);
+        self.mass[idx] += amount;
+    }
+
+    /// One explicit finite-difference diffusion step. For every pair of
+    /// axis-adjacent cells, computes a single flux value and applies it
+    /// as `-flux` to one cell and `+flux` to the other, into a fresh
+    /// buffer seeded from the current state — so total mass changes by
+    /// exactly zero per pair, and therefore exactly zero overall,
+    /// independent of floating-point summation order (this is what
+    /// `unified_engine.rs`'s mass-conservation tests, at 1e-9 relative
+    /// tolerance over hundreds of ticks, actually require: not
+    /// approximate conservation, exact-by-construction conservation).
+    /// Cells on the outer edge of the grid have no diffusion partner
+    /// beyond the boundary, so the boundary is implicitly zero-flux
+    /// (reflecting) — nothing here ever adds or removes mass at the
+    /// domain edge.
+    pub fn step(&mut self, dt: f64, diffusion_coeff: f64) {
+        let mut new_mass = self.mass.clone();
+        for iz in 0..self.nz {
+            for iy in 0..self.ny {
+                for ix in 0..self.nx {
+                    let here = self.flat_index(ix, iy, iz);
+                    if ix + 1 < self.nx {
+                        self.exchange_flux(&mut new_mass, here, self.flat_index(ix + 1, iy, iz), self.cell_size[0], dt, diffusion_coeff);
+                    }
+                    if iy + 1 < self.ny {
+                        self.exchange_flux(&mut new_mass, here, self.flat_index(ix, iy + 1, iz), self.cell_size[1], dt, diffusion_coeff);
+                    }
+                    if iz + 1 < self.nz {
+                        self.exchange_flux(&mut new_mass, here, self.flat_index(ix, iy, iz + 1), self.cell_size[2], dt, diffusion_coeff);
+                    }
+                }
+            }
+        }
+        self.mass = new_mass;
+    }
+
+    fn exchange_flux(&self, new_mass: &mut [f64], a: usize, b: usize, spacing: f64, dt: f64, diffusion_coeff: f64) {
+        let flux = diffusion_coeff * dt * (self.mass[a] - self.mass[b]) / (spacing * spacing);
+        new_mass[a] -= flux;
+        new_mass[b] += flux;
+    }
+
+    pub fn total_mass(&self) -> f64 {
+        self.mass.iter().sum()
+    }
+
+    /// The cell size (dx, dy, dz) this field's grid uses — needed by
+    /// cross-node coupling code (`mitonano_federated`) to compute a
+    /// boundary flux using the *same* formula `step`'s own interior
+    /// diffusion uses (see `boundary_mass`'s docs).
+    pub fn cell_size(&self) -> [f64; 3] {
+        self.cell_size
+    }
+
+    /// The raw cell *mass* (not concentration) of every cell in the
+    /// `face`'s ny*nz layer (`ix = 0` for `XFace::Min`, `ix = nx - 1` for
+    /// `XFace::Max`), in `iy + iz * ny` order.
+    ///
+    /// Added for cross-node field coupling (`mitonano_federated`): two
+    /// adjacent nodes' fields can exchange mass across their shared seam
+    /// by extracting each side's boundary layer with this method,
+    /// computing a flux, and applying it with [`add_boundary_mass`].
+    /// Returns *mass*, not concentration, specifically so that flux can
+    /// be computed with the exact same formula `step`'s own interior
+    /// `exchange_flux` uses (`diffusion_coeff * dt * (mass_a - mass_b) /
+    /// spacing^2`) — this is algebraically the same as Fick's law
+    /// `diffusion_coeff * (c_a - c_b) / spacing * face_area` once you
+    /// substitute `c = mass / (face_area * spacing)` and simplify, so
+    /// using mass directly here keeps the cross-node correction
+    /// numerically consistent with — not a different formula bolted onto
+    /// — the interior scheme, avoiding a discontinuity in the diffusion
+    /// operator right at a node seam.
+    ///
+    /// [`add_boundary_mass`]: ConcentrationField::add_boundary_mass
+    pub fn boundary_mass(&self, face: XFace) -> Vec<f64> {
+        let ix = match face {
+            XFace::Min => 0,
+            XFace::Max => self.nx - 1,
+        };
+        let mut out = Vec::with_capacity(self.ny * self.nz);
+        for iz in 0..self.nz {
+            for iy in 0..self.ny {
+                out.push(self.mass[self.flat_index(ix, iy, iz)]);
+            }
+        }
+        out
+    }
+
+    /// Adds `delta[iy + iz * ny]` mass directly to the `face`'s
+    /// corresponding cell — purely mechanical, no computation of its own.
+    /// Intended to be called with a flux already computed by cross-node
+    /// coupling code that read both sides' [`boundary_mass`] from a
+    /// shared pre-diffusion snapshot, so the mass added to one node's
+    /// face and the mass added (with the opposite sign) to its
+    /// neighbor's face are exact negatives of each other by construction
+    /// — exact conservation across the seam, the same way `step`'s own
+    /// interior `exchange_flux` conserves mass between any two adjacent
+    /// cells within one grid.
+    ///
+    /// [`boundary_mass`]: ConcentrationField::boundary_mass
+    pub fn add_boundary_mass(&mut self, face: XFace, delta: &[f64]) {
+        let ix = match face {
+            XFace::Min => 0,
+            XFace::Max => self.nx - 1,
+        };
+        for iz in 0..self.nz {
+            for iy in 0..self.ny {
+                let idx = self.flat_index(ix, iy, iz);
+                self.mass[idx] += delta[iy + iz * self.ny];
+            }
+        }
+    }
+}
+
+/// Which x-face of a `ConcentrationField`'s grid a boundary-layer
+/// operation refers to. Only x, because `mitonano_federated`'s domain
+/// decomposition (like `mitonano_orchestrator`'s) is 1D along x — see
+/// `boundary_mass`'s docs for what this is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum XFace {
+    Min,
+    Max,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn field() -> ConcentrationField {
+        ConcentrationField::new(Bounds::new([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]), 5, 5, 5)
+    }
+
+    #[test]
+    fn deposit_then_sample_reflects_the_deposited_mass() {
+        let mut f = field();
+        f.deposit([1.0, 1.0, 1.0], 4.0);
+        let vol = f.cell_volume();
+        assert!((f.sample([1.0, 1.0, 1.0]) - 4.0 / vol).abs() < 1e-12);
+    }
+
+    #[test]
+    fn gradient_is_exactly_zero_at_the_symmetric_center_of_a_point_source() {
+        // c(center - h) == c(center + h) by construction (a single
+        // centered deposit, sampled symmetrically about that same
+        // center) -- so the central-difference gradient must be exactly
+        // zero, not just approximately: this is an exact algebraic
+        // consequence of the symmetry, not a discretization-tolerance
+        // check.
+        let mut f = field();
+        f.deposit([5.0, 5.0, 5.0], 100.0); // exact center of the [0,10]^3 domain
+        let grad = f.gradient([5.0, 5.0, 5.0]);
+        assert_eq!(grad, [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn gradient_points_toward_higher_concentration() {
+        // A wider domain than `field()`'s default, so probe points can
+        // sit safely interior -- away from both the peak's own cell and
+        // the domain boundary, where clamping in `cell_indices` would
+        // distort a central difference into a boundary artifact rather
+        // than reflecting the field's true local slope (this was the
+        // actual cause of this test's first version failing: a probe
+        // point too close to the domain edge had its "outward" neighbor
+        // clamp back into the peak's own cell).
+        let bounds = Bounds::new([0.0, 0.0, 0.0], [20.0, 10.0, 10.0]);
+        let mut f = ConcentrationField::new(bounds, 10, 5, 5); // cell width 2.0 in x
+        f.deposit([11.0, 5.0, 5.0], 100.0); // center of the cell covering [10,12)
+
+        // x=9 sits in the cell immediately left of the peak's cell;
+        // stepping +h reaches the peak (high concentration), stepping -h
+        // reaches an empty cell further left -- concentration rises
+        // moving toward +x here, so the gradient should be positive.
+        let grad_left = f.gradient([9.0, 5.0, 5.0]);
+        assert!(grad_left[0] > 0.0, "left of the peak, concentration should rise toward +x, got grad_x={}", grad_left[0]);
+
+        // x=13 sits in the cell immediately right of the peak's cell;
+        // stepping +h reaches an empty cell further right, stepping -h
+        // reaches the peak -- concentration falls moving toward +x here,
+        // so the gradient should be negative.
+        let grad_right = f.gradient([13.0, 5.0, 5.0]);
+        assert!(grad_right[0] < 0.0, "right of the peak, concentration should fall toward +x, got grad_x={}", grad_right[0]);
+    }
+
+    #[test]
+    fn gradient_is_zero_for_a_perfectly_uniform_field() {
+        let mut f = field();
+        // Deposit the same amount in every cell -> uniform concentration.
+        for ix in 0..f.nx {
+            for iy in 0..f.ny {
+                for iz in 0..f.nz {
+                    let x = f.bounds.min[0] + (ix as f64 + 0.5) * f.cell_size[0];
+                    let y = f.bounds.min[1] + (iy as f64 + 0.5) * f.cell_size[1];
+                    let z = f.bounds.min[2] + (iz as f64 + 0.5) * f.cell_size[2];
+                    f.deposit([x, y, z], 10.0);
+                }
+            }
+        }
+        let grad = f.gradient([5.0, 5.0, 5.0]);
+        assert_eq!(grad, [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn withdraw_never_takes_more_than_available() {
+        let mut f = field();
+        f.deposit([1.0, 1.0, 1.0], 3.0);
+        let actual = f.withdraw([1.0, 1.0, 1.0], 100.0);
+        assert_eq!(actual, 3.0);
+        assert_eq!(f.total_mass(), 0.0);
+    }
+
+    #[test]
+    fn withdraw_and_deposit_are_exactly_self_canceling() {
+        let mut f = field();
+        f.deposit([2.0, 2.0, 2.0], 10.0);
+        let before = f.total_mass();
+        let taken = f.withdraw([2.0, 2.0, 2.0], 3.5);
+        f.deposit([2.0, 2.0, 2.0], taken);
+        assert_eq!(f.total_mass(), before);
+    }
+
+    #[test]
+    fn diffusion_step_conserves_total_mass_exactly() {
+        let mut f = field();
+        f.deposit([1.0, 1.0, 1.0], 20.0);
+        f.deposit([8.0, 8.0, 8.0], 5.0);
+        let before = f.total_mass();
+        for _ in 0..50 {
+            f.step(0.01, 0.2);
+        }
+        // Each individual flux exchange is exact (the same value
+        // subtracted from one cell and added to another), but summing
+        // 125 cells' worth of floating-point values via `total_mass`
+        // after 50 rounds of that isn't perfectly associative at the
+        // ~1e-14 scale — hence a tight relative tolerance here rather
+        // than bit-exact equality, consistent with the tolerance
+        // `unified_engine.rs`'s own tests use for the same kind of
+        // check (1e-9 relative error).
+        let rel_err = (f.total_mass() - before).abs() / before;
+        assert!(rel_err < 1e-9, "diffusion must conserve total mass: before={before} after={} rel_err={rel_err}", f.total_mass());
+    }
+
+    #[test]
+    fn diffusion_step_spreads_mass_toward_neighbors() {
+        let mut f = field();
+        f.deposit([5.0, 5.0, 5.0], 100.0);
+        let center_before = f.sample([5.0, 5.0, 5.0]);
+        f.step(0.01, 0.5);
+        let center_after = f.sample([5.0, 5.0, 5.0]);
+        assert!(center_after < center_before, "a concentrated deposit should lose concentration to its neighbors after diffusing");
+    }
+
+    #[test]
+    fn cell_indices_clamp_for_a_point_exactly_on_the_outer_max_edge() {
+        let f = field();
+        // Should not panic or index out of bounds.
+        let _ = f.sample([10.0, 10.0, 10.0]);
+    }
+
+    #[test]
+    fn boundary_mass_extracts_the_correct_layer() {
+        let mut f = field(); // 5x5x5 grid over [0,10]^3
+        f.deposit([0.5, 5.0, 5.0], 7.0); // ix=0 -> the Min-x layer
+        f.deposit([9.5, 5.0, 5.0], 3.0); // ix=4 -> the Max-x layer
+        let min_layer = f.boundary_mass(XFace::Min);
+        let max_layer = f.boundary_mass(XFace::Max);
+        assert_eq!(min_layer.len(), 5 * 5);
+        assert_eq!(max_layer.len(), 5 * 5);
+        assert!((min_layer.iter().sum::<f64>() - 7.0).abs() < 1e-12);
+        assert!((max_layer.iter().sum::<f64>() - 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn add_boundary_mass_adds_to_the_correct_layer_only() {
+        let mut f = field();
+        let delta = vec![1.0; 25];
+        f.add_boundary_mass(XFace::Min, &delta);
+        assert!((f.boundary_mass(XFace::Min).iter().sum::<f64>() - 25.0).abs() < 1e-12);
+        assert!((f.boundary_mass(XFace::Max).iter().sum::<f64>() - 0.0).abs() < 1e-12, "Max layer must be untouched");
+        assert!((f.total_mass() - 25.0).abs() < 1e-12);
+    }
+
+    /// The actual point of `boundary_mass`/`add_boundary_mass`: two
+    /// separate `ConcentrationField`s, representing adjacent nodes, can
+    /// exchange mass across their shared seam using the exact same
+    /// mass/spacing^2 flux formula `step`'s own interior diffusion uses,
+    /// and that exchange conserves the *combined* total mass of both
+    /// fields exactly — proving the mechanism these two methods exist to
+    /// support is actually conservative before `mitonano_federated` ever
+    /// uses it.
+    #[test]
+    fn cross_field_boundary_exchange_conserves_combined_mass_exactly() {
+        let bounds_a = Bounds::new([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]);
+        let bounds_b = Bounds::new([10.0, 0.0, 0.0], [20.0, 10.0, 10.0]);
+        let mut field_a = ConcentrationField::new(bounds_a, 5, 5, 5);
+        let mut field_b = ConcentrationField::new(bounds_b, 5, 5, 5);
+        field_a.deposit([9.5, 5.0, 5.0], 40.0); // right up against the seam
+        field_b.deposit([10.5, 5.0, 5.0], 5.0); // right up against the seam, other side
+
+        let combined_before = field_a.total_mass() + field_b.total_mass();
+
+        // Mirrors exactly what mitonano_federated's step() does: snapshot
+        // both sides' boundary mass (pre-exchange), compute one flux per
+        // cell using the interior formula, apply with opposite signs.
+        let mass_a = field_a.boundary_mass(XFace::Max);
+        let mass_b = field_b.boundary_mass(XFace::Min);
+        let spacing = field_a.cell_size()[0];
+        let d = 0.3;
+        let dt = 0.01;
+        let flux: Vec<f64> = mass_a.iter().zip(&mass_b).map(|(&ma, &mb)| d * dt * (ma - mb) / (spacing * spacing)).collect();
+        let neg_flux: Vec<f64> = flux.iter().map(|f| -f).collect();
+        field_a.add_boundary_mass(XFace::Max, &neg_flux);
+        field_b.add_boundary_mass(XFace::Min, &flux);
+
+        let combined_after = field_a.total_mass() + field_b.total_mass();
+        assert!(
+            (combined_after - combined_before).abs() < 1e-12,
+            "cross-field boundary exchange must conserve combined mass exactly: before={combined_before} after={combined_after}"
+        );
+        assert!(field_a.total_mass() < 40.0, "the higher-mass side should lose mass across the seam");
+        assert!(field_b.total_mass() > 5.0, "the lower-mass side should gain mass across the seam");
+    }
+}
