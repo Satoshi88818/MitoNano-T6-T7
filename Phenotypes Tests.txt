@@ -1,0 +1,417 @@
+//! This is the test the whole crate exists to run: does splitting the
+//! real physics (`mitonano_core::UnifiedEngine`) across multiple
+//! independently-stepped nodes, with agents actually migrating between
+//! them mid-simulation, still hold the same exact mass-bookkeeping
+//! identity `mitonano_core::unified_engine`'s own single-engine tests
+//! check?
+//!
+//! `total_combined_mass(t) == C0 - cumulative_eliminated(t)` — proven for
+//! one `UnifiedEngine` by that crate's own
+//! `full_system_matches_exact_bookkeeping_identity_under_maximum_complexity`
+//! test. This file proves the same identity holds for the *sum* across
+//! every node's engine and field in a real, migrating, multi-node
+//! cluster — motion, field release/uptake, agent-agent exchange, field
+//! diffusion, and cross-node migration all simultaneously active.
+
+use mitonano_core::agent::AgentParams;
+use mitonano_core::environment::Bounds;
+use mitonano_core::interaction::InteractionParams;
+use mitonano_core::mobility::TwoStateParams;
+use mitonano_core::population::{FissionParams, FusionParams};
+use mitonano_federated::{FederatedEngineConfig, FederatedUnifiedEngine};
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+
+/// Real physics, real migration, zero elimination: total combined mass
+/// (every node's agent payloads + every node's field mass) must be
+/// exactly conserved at every tick, the same invariant
+/// `mitonano_core::unified_engine`'s own
+/// `full_system_exactly_conserves_mass_with_zero_elimination` test
+/// checks for a single engine — now summed across a 5-node cluster with
+/// agents crossing node boundaries throughout the run.
+#[test]
+fn global_mass_is_exactly_conserved_across_a_distributed_run_with_zero_elimination() {
+    let global_bounds = Bounds::new([0.0, -6.0, -6.0], [60.0, 6.0, 6.0]);
+    let config = FederatedEngineConfig {
+        agent_params: AgentParams { drift: [1.2, 0.05, -0.03], diffusion_coeff: 0.2, k_elim: 0.0, k_release: 0.2 },
+        interaction: InteractionParams { radius: 1.0, k_exchange: 0.2 },
+        field_diffusion_coeff: 0.12,
+        dt: 0.01,
+        k_uptake: 0.25,
+        field_grid: (5, 4, 4),
+        index_grid: (5, 4, 4),
+        saturable_uptake: None,
+        chemotaxis: None,
+        fission: None,
+        fusion: None,
+        two_state: None,
+    };
+    let mut engine = FederatedUnifiedEngine::new(5, global_bounds, config); // slabs of width 12 each
+
+    let mut rng_init = StdRng::seed_from_u64(31);
+    for i in 0..60 {
+        let x = rng_init.gen_range(0.5..59.5);
+        let y = rng_init.gen_range(-5.5..5.5);
+        let z = rng_init.gen_range(-5.5..5.5);
+        let payload = rng_init.gen_range(1.0..10.0);
+        engine.add_agent(i, [x, y, z], payload);
+    }
+
+    let c0 = engine.stats().total_combined_mass; // all initial payload, zero field mass at t=0
+
+    let mut rng = StdRng::seed_from_u64(2026);
+    for tick in 1..=800 {
+        engine.step(&mut rng);
+        let stats = engine.stats();
+        let rel_err = (stats.total_combined_mass - c0).abs() / c0;
+        assert!(
+            rel_err < 1e-9,
+            "tick {tick}: combined mass {} vs initial {} (rel_err {rel_err})",
+            stats.total_combined_mass,
+            c0
+        );
+        assert_eq!(stats.cumulative_eliminated, 0.0, "k_elim=0.0 must mean zero elimination throughout");
+    }
+
+    assert!(!engine.migration_log().is_empty(), "positive x-drift across a 5-node, 60-unit-wide cluster over 800 ticks should produce cross-node migrations");
+}
+
+/// Same scenario, but with real elimination active too (all four transfer
+/// pathways simultaneously: motion, field release/uptake, agent-agent
+/// exchange, and now true elimination, plus cross-node migration). No
+/// closed form exists for `total_combined_mass(t)` here, but the
+/// bookkeeping identity `total_combined_mass(t) == C0 - cumulative_eliminated(t)`
+/// must still hold exactly — the distributed analogue of
+/// `mitonano_core::unified_engine`'s own
+/// `full_system_matches_exact_bookkeeping_identity_under_maximum_complexity`,
+/// the strongest test in that crate, now proven across a real migrating
+/// cluster instead of one engine.
+#[test]
+fn global_bookkeeping_identity_holds_under_maximum_complexity_with_real_migration() {
+    let global_bounds = Bounds::new([0.0, -6.0, -6.0], [60.0, 6.0, 6.0]);
+    let config = FederatedEngineConfig {
+        agent_params: AgentParams { drift: [1.5, -0.1, 0.08], diffusion_coeff: 0.25, k_elim: 0.03, k_release: 0.18 },
+        interaction: InteractionParams { radius: 1.2, k_exchange: 0.25 },
+        field_diffusion_coeff: 0.15,
+        dt: 0.01,
+        k_uptake: 0.3,
+        field_grid: (5, 4, 4),
+        index_grid: (5, 4, 4),
+        saturable_uptake: None,
+        chemotaxis: None,
+        fission: None,
+        fusion: None,
+        two_state: None,
+    };
+    let mut engine = FederatedUnifiedEngine::new(5, global_bounds, config);
+
+    let mut rng_init = StdRng::seed_from_u64(53);
+    for i in 0..80 {
+        let x = rng_init.gen_range(0.5..59.5);
+        let y = rng_init.gen_range(-5.5..5.5);
+        let z = rng_init.gen_range(-5.5..5.5);
+        let payload = rng_init.gen_range(1.0..12.0);
+        engine.add_agent(i, [x, y, z], payload);
+    }
+
+    let c0 = engine.stats().total_combined_mass;
+
+    let mut rng = StdRng::seed_from_u64(4);
+    for tick in 1..=1000 {
+        engine.step(&mut rng);
+        let stats = engine.stats();
+        let expected = c0 - stats.cumulative_eliminated;
+        let rel_err = (stats.total_combined_mass - expected).abs() / c0;
+        assert!(
+            rel_err < 1e-9,
+            "tick {tick}: combined mass {} vs C0-eliminated {} (rel_err {rel_err})",
+            stats.total_combined_mass,
+            expected
+        );
+    }
+
+    let final_stats = engine.stats();
+    assert!(final_stats.cumulative_eliminated > 0.0, "k_elim > 0 over 1000 ticks should have eliminated some mass");
+    assert!(final_stats.cumulative_eliminated < c0, "cannot eliminate more mass than existed");
+    assert!(!engine.migration_log().is_empty(), "this scenario should also produce cross-node migrations");
+    assert_eq!(engine.total_agent_count(), 80, "no agent should be lost or duplicated by migration despite everything else happening simultaneously");
+}
+
+/// The integration-level counterpart to `mitonano_federated`'s own unit
+/// tests for `rebalance` (which check it in isolation, immediately after
+/// construction): this checks that rebalancing composes correctly when
+/// interleaved with everything else this crate does simultaneously — real
+/// physics stepping, real cross-node interaction and diffusion, real
+/// migration, and real elimination, periodically interrupted by a
+/// rebalance — and that the same bookkeeping identity
+/// `total_combined_mass(t) == C0 - cumulative_eliminated(t)` survives a
+/// rebalance's complete replacement of every node's field and agent list
+/// exactly as cleanly as it survives an ordinary tick.
+#[test]
+fn global_bookkeeping_identity_survives_periodic_rebalancing_during_a_real_run() {
+    let global_bounds = Bounds::new([0.0, -6.0, -6.0], [60.0, 6.0, 6.0]);
+    let config = FederatedEngineConfig {
+        agent_params: AgentParams { drift: [1.0, -0.05, 0.03], diffusion_coeff: 0.2, k_elim: 0.02, k_release: 0.2 },
+        interaction: InteractionParams { radius: 1.0, k_exchange: 0.2 },
+        field_diffusion_coeff: 0.12,
+        dt: 0.01,
+        k_uptake: 0.25,
+        field_grid: (6, 4, 4),
+        index_grid: (6, 4, 4),
+        saturable_uptake: None,
+        chemotaxis: None,
+        fission: None,
+        fusion: None,
+        two_state: None,
+    };
+    let mut engine = FederatedUnifiedEngine::new(5, global_bounds, config);
+
+    let mut rng_init = StdRng::seed_from_u64(17);
+    for i in 0..60 {
+        // Deliberately clustered near the low end, so the cluster starts
+        // out badly imbalanced and rebalancing has real work to do.
+        let x = rng_init.gen_range(0.5..8.0);
+        let y = rng_init.gen_range(-5.5..5.5);
+        let z = rng_init.gen_range(-5.5..5.5);
+        let payload = rng_init.gen_range(1.0..10.0);
+        engine.add_agent(i, [x, y, z], payload);
+    }
+
+    let c0 = engine.stats().total_combined_mass;
+    let mut rng = StdRng::seed_from_u64(2027);
+    let mut rebalance_count = 0;
+
+    for tick in 1..=600 {
+        engine.step(&mut rng);
+        if tick % 50 == 0 {
+            if engine.rebalance_if_needed(1.5).is_some() {
+                rebalance_count += 1;
+            }
+            // The identity must hold immediately after a rebalance too,
+            // not just settle back into place a few ticks later.
+            let stats = engine.stats();
+            let expected = c0 - stats.cumulative_eliminated;
+            let rel_err = (stats.total_combined_mass - expected).abs() / c0;
+            assert!(rel_err < 1e-9, "tick {tick} (post-rebalance): combined mass {} vs C0-eliminated {} (rel_err {rel_err})", stats.total_combined_mass, expected);
+        }
+        let stats = engine.stats();
+        let expected = c0 - stats.cumulative_eliminated;
+        let rel_err = (stats.total_combined_mass - expected).abs() / c0;
+        assert!(rel_err < 1e-9, "tick {tick}: combined mass {} vs C0-eliminated {} (rel_err {rel_err})", stats.total_combined_mass, expected);
+    }
+
+    assert!(rebalance_count > 0, "this scenario (clustered start, checked every 50 ticks) should have triggered at least one rebalance");
+    assert_eq!(engine.total_agent_count(), 60, "no agent should be lost or duplicated across the whole run, rebalances included");
+}
+
+/// The final integration test: does the bookkeeping identity survive
+/// *everything this crate does* simultaneously — real physics, real
+/// cross-node interaction and diffusion, real migration, real
+/// elimination, periodic rebalancing, and now agents actually being
+/// created (fission) and destroyed (fusion) mid-run, not just moved
+/// around? Fission and fusion neither touch the field nor
+/// `cumulative_eliminated` — they only ever move payload between agents
+/// (split one into two, or merge two into one) — so the *same* identity
+/// `total_combined_mass(t) == C0 - cumulative_eliminated(t)` that held
+/// before fission/fusion existed must still hold exactly, even as the
+/// population size itself changes underneath it.
+#[test]
+fn global_bookkeeping_identity_survives_fission_and_fusion_alongside_everything_else() {
+    let global_bounds = Bounds::new([0.0, -6.0, -6.0], [60.0, 6.0, 6.0]);
+    let config = FederatedEngineConfig {
+        agent_params: AgentParams { drift: [0.8, -0.05, 0.03], diffusion_coeff: 0.2, k_elim: 0.02, k_release: 0.2 },
+        interaction: InteractionParams { radius: 1.0, k_exchange: 0.2 },
+        field_diffusion_coeff: 0.12,
+        dt: 0.01,
+        k_uptake: 0.25,
+        field_grid: (6, 4, 4),
+        index_grid: (6, 4, 4),
+        saturable_uptake: None,
+        chemotaxis: None,
+        fission: Some(FissionParams { rate: 0.3, payload_fraction: 0.5, next_generated_id: 1_000_000, mutation: None }),
+        fusion: Some(FusionParams { radius: 1.0, rate: 0.3 }),
+        two_state: None,
+    };
+    let mut engine = FederatedUnifiedEngine::new(5, global_bounds, config);
+
+    let mut rng_init = StdRng::seed_from_u64(23);
+    for i in 0..50 {
+        let x = rng_init.gen_range(0.5..15.0); // clustered, so both migration and rebalancing have real work to do
+        let y = rng_init.gen_range(-5.5..5.5);
+        let z = rng_init.gen_range(-5.5..5.5);
+        let payload = rng_init.gen_range(1.0..10.0);
+        engine.add_agent(i, [x, y, z], payload);
+    }
+
+    let c0 = engine.stats().total_combined_mass;
+    let count0 = engine.total_agent_count();
+    let mut rng = StdRng::seed_from_u64(2028);
+
+    for tick in 1..=500 {
+        engine.step(&mut rng);
+        if tick % 50 == 0 {
+            engine.rebalance_if_needed(1.5);
+        }
+        let stats = engine.stats();
+        let expected = c0 - stats.cumulative_eliminated;
+        let rel_err = (stats.total_combined_mass - expected).abs() / c0;
+        assert!(
+            rel_err < 1e-9,
+            "tick {tick}: combined mass {} vs C0-eliminated {} (rel_err {rel_err}); population count at this tick: {}",
+            stats.total_combined_mass,
+            expected,
+            engine.total_agent_count()
+        );
+    }
+
+    let final_count = engine.total_agent_count();
+    assert_ne!(final_count, count0, "with fission at rate=0.3 and fusion at rate=0.3 over 500 ticks, population should have measurably changed from its starting count");
+    assert!(final_count > 0, "population should not have been wiped out entirely");
+}
+
+/// The final integration test: does the bookkeeping identity survive
+/// literally everything this crate does at once — real physics, real
+/// cross-node interaction and diffusion, real migration, real
+/// elimination, periodic rebalancing, fission, fusion, *and* two-state
+/// mobility switching, all active simultaneously? Two-state switching
+/// neither touches the field nor `cumulative_eliminated` (see
+/// `mitonano_core::mobility`'s own docs — bound agents still exchange
+/// payload with the field normally, only their *motion* is affected), so
+/// the identity must hold exactly here too, same as it did for
+/// fission/fusion alone.
+#[test]
+fn global_bookkeeping_identity_survives_two_state_kinetics_alongside_everything_else() {
+    let global_bounds = Bounds::new([0.0, -6.0, -6.0], [60.0, 6.0, 6.0]);
+    let config = FederatedEngineConfig {
+        agent_params: AgentParams { drift: [0.7, -0.05, 0.03], diffusion_coeff: 0.2, k_elim: 0.02, k_release: 0.2 },
+        interaction: InteractionParams { radius: 1.0, k_exchange: 0.2 },
+        field_diffusion_coeff: 0.12,
+        dt: 0.01,
+        k_uptake: 0.25,
+        field_grid: (6, 4, 4),
+        index_grid: (6, 4, 4),
+        saturable_uptake: None,
+        chemotaxis: None,
+        fission: Some(FissionParams { rate: 0.15, payload_fraction: 0.5, next_generated_id: 2_000_000, mutation: None }),
+        fusion: Some(FusionParams { radius: 1.0, rate: 0.15 }),
+        two_state: Some(TwoStateParams { k_on: 0.5, k_off: 0.8 }),
+    };
+    let mut engine = FederatedUnifiedEngine::new(5, global_bounds, config);
+
+    let mut rng_init = StdRng::seed_from_u64(29);
+    for i in 0..50 {
+        let x = rng_init.gen_range(0.5..15.0);
+        let y = rng_init.gen_range(-5.5..5.5);
+        let z = rng_init.gen_range(-5.5..5.5);
+        let payload = rng_init.gen_range(1.0..10.0);
+        engine.add_agent(i, [x, y, z], payload);
+    }
+
+    let c0 = engine.stats().total_combined_mass;
+    let mut rng = StdRng::seed_from_u64(2029);
+
+    for tick in 1..=500 {
+        engine.step(&mut rng);
+        if tick % 50 == 0 {
+            engine.rebalance_if_needed(1.5);
+        }
+        let stats = engine.stats();
+        let expected = c0 - stats.cumulative_eliminated;
+        let rel_err = (stats.total_combined_mass - expected).abs() / c0;
+        assert!(
+            rel_err < 1e-9,
+            "tick {tick}: combined mass {} vs C0-eliminated {} (rel_err {rel_err}); population count at this tick: {}",
+            stats.total_combined_mass,
+            expected,
+            engine.total_agent_count()
+        );
+    }
+
+    assert!(engine.total_agent_count() > 0, "population should not have been wiped out entirely");
+    let bound_count = engine.nodes.iter().flat_map(|n| n.engine.agents.iter()).filter(|a| a.mobility == mitonano_core::agent::MobilityState::Bound).count();
+    let mobile_count = engine.total_agent_count() - bound_count;
+    assert!(bound_count > 0 && mobile_count > 0, "with k_on/k_off both active over 500 ticks, the population should contain a genuine mix of both states, not have collapsed to all-one-state");
+}
+
+/// The final, most complete integration test: does the bookkeeping
+/// identity survive everything this crate does at once, now including
+/// heterogeneous phenotypes propagating (and, via `fission.mutation`,
+/// occasionally diverging) through real fission events, alongside real
+/// physics, cross-node interaction and diffusion, migration, elimination,
+/// periodic rebalancing, fusion, and two-state kinetics? Heterogeneity
+/// itself neither touches the field nor `cumulative_eliminated` beyond
+/// what each agent's own resolved `AgentParams` already accounts for
+/// through the ordinary decay/release pathway, so the same identity that
+/// held before phenotypes existed must still hold exactly here, with a
+/// mixed population of default- and damaged-phenotype agents coexisting
+/// throughout.
+#[test]
+fn global_bookkeeping_identity_survives_heterogeneous_phenotypes_alongside_everything_else() {
+    let global_bounds = Bounds::new([0.0, -6.0, -6.0], [60.0, 6.0, 6.0]);
+    let damaged_phenotype = AgentParams { drift: [0.8, -0.05, 0.03], diffusion_coeff: 0.5, k_elim: 0.15, k_release: 0.1 };
+    let config = FederatedEngineConfig {
+        agent_params: AgentParams { drift: [0.7, -0.05, 0.03], diffusion_coeff: 0.2, k_elim: 0.02, k_release: 0.2 },
+        interaction: InteractionParams { radius: 1.0, k_exchange: 0.2 },
+        field_diffusion_coeff: 0.12,
+        dt: 0.01,
+        k_uptake: 0.25,
+        field_grid: (6, 4, 4),
+        index_grid: (6, 4, 4),
+        saturable_uptake: None,
+        chemotaxis: None,
+        fission: Some(FissionParams {
+            rate: 0.15,
+            payload_fraction: 0.5,
+            next_generated_id: 3_000_000,
+            mutation: Some(MutationParams { probability: 0.3, damaged_phenotype }),
+        }),
+        fusion: Some(FusionParams { radius: 1.0, rate: 0.15 }),
+        two_state: Some(TwoStateParams { k_on: 0.5, k_off: 0.8 }),
+    };
+    let mut engine = FederatedUnifiedEngine::new(5, global_bounds, config);
+
+    let mut rng_init = StdRng::seed_from_u64(31);
+    for i in 0..50 {
+        let x = rng_init.gen_range(0.5..15.0);
+        let y = rng_init.gen_range(-5.5..5.5);
+        let z = rng_init.gen_range(-5.5..5.5);
+        let payload = rng_init.gen_range(1.0..10.0);
+        engine.add_agent(i, [x, y, z], payload);
+        // Half the initial population starts with the damaged phenotype
+        // directly, independent of anything fission's mutation might do
+        // later -- a genuinely mixed population from tick 1.
+        if i % 2 == 0 {
+            let node = engine.nodes.iter_mut().find(|n| n.agent_ids.contains(&i)).unwrap();
+            let idx = node.agent_ids.iter().position(|&id| id == i).unwrap();
+            node.engine.agents[idx].phenotype = Some(damaged_phenotype);
+        }
+    }
+
+    let c0 = engine.stats().total_combined_mass;
+    let mut rng = StdRng::seed_from_u64(2030);
+
+    for tick in 1..=500 {
+        engine.step(&mut rng);
+        if tick % 50 == 0 {
+            engine.rebalance_if_needed(1.5);
+        }
+        let stats = engine.stats();
+        let expected = c0 - stats.cumulative_eliminated;
+        let rel_err = (stats.total_combined_mass - expected).abs() / c0;
+        assert!(
+            rel_err < 1e-9,
+            "tick {tick}: combined mass {} vs C0-eliminated {} (rel_err {rel_err}); population count at this tick: {}",
+            stats.total_combined_mass,
+            expected,
+            engine.total_agent_count()
+        );
+    }
+
+    assert!(engine.total_agent_count() > 0, "population should not have been wiped out entirely");
+    let default_count = engine.nodes.iter().flat_map(|n| n.engine.agents.iter()).filter(|a| a.phenotype.is_none()).count();
+    let damaged_count = engine.total_agent_count() - default_count;
+    assert!(
+        default_count > 0 && damaged_count > 0,
+        "with an initially-mixed population plus ongoing mutation-on-fission, the final population should still contain both default and damaged phenotypes"
+    );
+}
